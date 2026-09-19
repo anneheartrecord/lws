@@ -27,6 +27,7 @@ import (
 	"github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -93,11 +94,26 @@ var _ = ginkgo.Describe("Controller upgrade", ginkgo.Ordered, func() {
 				g.Expect(err).NotTo(gomega.HaveOccurred())
 				g.Expect(current).To(gomega.Equal(expected))
 			}, 30*time.Second, time.Second).Should(gomega.Succeed())
-			expectServicesOwnedByLeaderWorkerSets()
+			if legacyCRD {
+				expectLeaderWorkerSetCRDKept()
+			} else {
+				expectServicesOwnedByLeaderWorkerSets()
+			}
 			createNewWorkloads()
 		}
 	})
 })
+
+// expectLeaderWorkerSetCRDKept verifies the migration documented in
+// charts/lws/README.md: after the release stops rendering the CRD, Helm left it
+// in place because of the resource-policy annotation.
+func expectLeaderWorkerSetCRDKept() {
+	ginkgo.By("verifying the LeaderWorkerSet CRD survived the Helm upgrade")
+	crd := &apiextensionsv1.CustomResourceDefinition{}
+	gomega.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "leaderworkersets.leaderworkerset.x-k8s.io"}, crd)).To(gomega.Succeed())
+	gomega.Expect(crd.DeletionTimestamp).To(gomega.BeNil())
+	gomega.Expect(crd.Annotations).To(gomega.HaveKeyWithValue("helm.sh/resource-policy", "keep"))
+}
 
 func waitForWebhooks() {
 	ginkgo.By("waiting for the LeaderWorkerSet webhook")
@@ -106,6 +122,9 @@ func waitForWebhooks() {
 		return k8sClient.Create(ctx, probe, client.DryRunAll)
 	}, 2*time.Minute, 2*time.Second).Should(gomega.Succeed())
 
+	if legacyCRD {
+		return
+	}
 	ginkgo.By("waiting for the DisaggregatedSet webhook")
 	gomega.Eventually(func() error {
 		probe := newDisaggregatedSet("default", "upgrade-ds-webhook-probe")
@@ -127,6 +146,9 @@ func createExistingWorkloads() {
 	testutils.ExpectValidPods(ctx, k8sClient, lws, &corev1.PodList{})
 	testutils.ExpectValidServices(ctx, k8sClient, lws, 1)
 
+	if legacyCRD {
+		return
+	}
 	ginkgo.By("creating a DisaggregatedSet with the old controller")
 	ds := newDisaggregatedSet(testNamespace, existingDSName)
 	gomega.Expect(k8sClient.Create(ctx, ds)).To(gomega.Succeed())
@@ -140,6 +162,9 @@ func createNewWorkloads() {
 	testutils.ExpectLeaderWorkerSetAvailable(ctx, k8sClient, lws, "")
 	testutils.ExpectValidPods(ctx, k8sClient, lws, &corev1.PodList{})
 
+	if legacyCRD {
+		return
+	}
 	ginkgo.By("creating a new DisaggregatedSet with the upgraded controller")
 	ds := newDisaggregatedSet(testNamespace, newDSName)
 	gomega.Expect(k8sClient.Create(ctx, ds)).To(gomega.Succeed())
@@ -254,6 +279,19 @@ func captureSnapshot() (upgradeSnapshot, error) {
 		return upgradeSnapshot{}, err
 	}
 
+	pods, err := workloadPodSnapshots()
+	if err != nil {
+		return upgradeSnapshot{}, err
+	}
+	if legacyCRD {
+		// Releases before v0.9.0 have no DisaggregatedSet; the standalone LWS and
+		// its pods are the whole story.
+		return upgradeSnapshot{
+			LeaderWorkerSet: objectSnapshot{UID: lws.UID, Generation: lws.Generation},
+			WorkloadPods:    pods,
+		}, nil
+	}
+
 	ds := &disaggregatedsetv1.DisaggregatedSet{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: existingDSName}, ds); err != nil {
 		return upgradeSnapshot{}, err
@@ -289,11 +327,6 @@ func captureSnapshot() (upgradeSnapshot, error) {
 	})
 
 	services, err := generatedServiceSnapshots()
-	if err != nil {
-		return upgradeSnapshot{}, err
-	}
-
-	pods, err := workloadPodSnapshots()
 	if err != nil {
 		return upgradeSnapshot{}, err
 	}
@@ -374,18 +407,20 @@ func workloadPodSnapshots() ([]podSnapshot, error) {
 		return nil, fmt.Errorf("expected 4 standalone LeaderWorkerSet pods, got %d", len(standalonePods.Items))
 	}
 
-	dsPods := &corev1.PodList{}
-	if err := k8sClient.List(ctx, dsPods,
-		client.InNamespace(testNamespace),
-		client.MatchingLabels{disaggregatedsetv1.SetNameLabelKey: existingDSName},
-	); err != nil {
-		return nil, err
+	allPods := standalonePods.Items
+	if !legacyCRD {
+		dsPods := &corev1.PodList{}
+		if err := k8sClient.List(ctx, dsPods,
+			client.InNamespace(testNamespace),
+			client.MatchingLabels{disaggregatedsetv1.SetNameLabelKey: existingDSName},
+		); err != nil {
+			return nil, err
+		}
+		if len(dsPods.Items) != 2 {
+			return nil, fmt.Errorf("expected 2 DisaggregatedSet pods, got %d", len(dsPods.Items))
+		}
+		allPods = append(allPods, dsPods.Items...)
 	}
-	if len(dsPods.Items) != 2 {
-		return nil, fmt.Errorf("expected 2 DisaggregatedSet pods, got %d", len(dsPods.Items))
-	}
-
-	allPods := append(standalonePods.Items, dsPods.Items...)
 	snapshots := make([]podSnapshot, 0, len(allPods))
 	for i := range allPods {
 		pod := &allPods[i]

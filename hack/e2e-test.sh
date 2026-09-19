@@ -23,6 +23,12 @@ LWS_UPGRADE_FROM_VERSION=${LWS_UPGRADE_FROM_VERSION:-""}
 # LWS_UPGRADE_METHOD selects how the old release is installed and upgraded:
 # "manifests" (default, kustomize) or "helm".
 LWS_UPGRADE_METHOD=${LWS_UPGRADE_METHOD:-"manifests"}
+# LWS_UPGRADE_LEGACY_CRD=true runs the documented one-time migration for releases
+# up to v0.7.0, whose chart rendered the LeaderWorkerSet CRD from templates/crds/.
+# Without it the first helm upgrade across the v0.8.0 boundary deletes the CRD
+# (#880). It also skips the DisaggregatedSet parts of the upgrade spec, since that
+# CRD only exists from v0.9.0.
+LWS_UPGRADE_LEGACY_CRD=${LWS_UPGRADE_LEGACY_CRD:-"false"}
 HELM=${HELM:-"./bin/helm"}
 HELM_CHART_REPO=${HELM_CHART_REPO:-"registry.k8s.io/lws/charts"}
 HELM_RELEASE_NAME=${HELM_RELEASE_NAME:-"lws"}
@@ -183,6 +189,12 @@ function upgrade_to_current_helm {
     # Follow the documented Helm upgrade procedure: reconcile CRDs explicitly
     # (helm upgrade never touches crds/), then upgrade the release in place with
     # the locally built, kind-loaded controller image.
+    if [ "$LWS_UPGRADE_LEGACY_CRD" == "true" ]; then
+        # charts/lws/README.md, "Upgrading from v0.7.0 or earlier": keep the CRD
+        # when it leaves the Helm release manifest.
+        $KUBECTL annotate crd leaderworkersets.leaderworkerset.x-k8s.io \
+            helm.sh/resource-policy=keep --overwrite
+    fi
     $KUBECTL apply --server-side --force-conflicts -f "$CWD/charts/lws/crds"
 
     local image_repo="${IMAGE_TAG%:*}"
@@ -202,6 +214,7 @@ function upgrade_to_current_helm {
 function run_upgrade_phase {
     local phase="$1"
     LWS_UPGRADE_PHASE="$phase" \
+    LWS_UPGRADE_LEGACY_CRD="$LWS_UPGRADE_LEGACY_CRD" \
     LWS_UPGRADE_SNAPSHOT_PATH="$SNAPSHOT_PATH" \
     IMAGE_TAG="$IMAGE_TAG" \
     LWS_NAMESPACE="$LWS_NAMESPACE" \
